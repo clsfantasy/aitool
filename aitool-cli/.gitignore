@@ -31,9 +31,3 @@ build/
 
 ### VS Code ###
 .vscode/
-
-### Application Configuration ###
-# 忽略包含敏感信息的配置文件
-src/main/resources/application.properties
-# 保留模板文件供其他开发者参考
-!src/main/resources/application.properties.template
