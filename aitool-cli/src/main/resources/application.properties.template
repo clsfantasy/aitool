@@ -1,0 +1,9 @@
+spring.application.name=aitool-cli
+# DeepSeek API 配置 (兼容 OpenAI 格式)
+ai.api.url=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+# 在此处填入你的 API Key（格式：sk-开头的字符串）
+ai.api.key=YOUR_API_KEY_HERE
+ai.model.name=gemini-2.5-flash
+
+# 控制台输出配置
+spring.output.ansi.enabled=ALWAYS
