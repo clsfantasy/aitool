@@ -9,6 +9,7 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
@@ -17,9 +18,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-@Slf4j // 启用日志
+@Slf4j
 @Service
 public class AiService {
+
+    private static final int MAX_TOOL_CALLS = 10;
 
     @Value("${ai.api.url}")
     private String apiUrl;
@@ -30,130 +33,105 @@ public class AiService {
     @Value("${ai.model.name}")
     private String modelName;
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate;
     private final List<ChatRequest.Message> history = new ArrayList<>();
-
-    // 工具注册表 (Map<工具名, 工具对象>)
     private final Map<String, AgentTool> toolMap;
-    // 工具描述文本 (给 AI 看的说明书)
     private final String toolsPrompt;
 
-    // 🏆 构造函数注入：Spring 会自动把所有实现了 AgentTool 的类（比如 FileReadTool）塞进这个 List 里
     public AiService(List<AgentTool> tools) {
-        // 1. 转成 Map 方便查找
-        this.toolMap = tools.stream().collect(Collectors.toMap(AgentTool::getName, t -> t));
+        // 配置超时时间：连接 10s，读取 30s
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(10_000);
+        factory.setReadTimeout(30_000);
+        this.restTemplate = new RestTemplate(factory);
 
-        // 2. 生成工具说明书
+        this.toolMap = tools.stream().collect(Collectors.toMap(AgentTool::getName, t -> t));
         this.toolsPrompt = tools.stream()
                 .map(t -> "- " + t.getName() + ": " + t.getDescription())
                 .collect(Collectors.joining("\n"));
-
-        // 3. 初始化 System Prompt (赋予 AI 人设)
         initMemory();
     }
 
     private void initMemory() {
         history.clear();
-        // 构建强大的 System Prompt
         String systemInstruction = """
             你是一个资深的 Java 智能助手 (Agent)。
             
-            你可以使用以下工具来辅助用户：
+            你可以使用以下工具：
             %s
             
-            如果你需要使用工具，请**不要**直接回答，而是只输出以下格式的指令：
-            [TOOL: 工具名 参数]
-            
-            例如：如果要读 Main.java，请输出：
-            [TOOL: read_file src/Main.java]
+            规则：
+            1. 每次只输出一个工具指令。
+            2. 格式必须严格为：[TOOL: 工具名 参数]
+            3. 如果 read_file 失败，请尝试使用 list_files。
             """.formatted(toolsPrompt);
 
-        history.add(ChatRequest.Message.builder()
-                .role("system")
-                .content(systemInstruction)
-                .build());
+        history.add(ChatRequest.Message.builder().role("system").content(systemInstruction).build());
     }
 
     public String callAi(String userMessage) {
-        // 1. 先把消息包装好
-        var userMsgObj = ChatRequest.Message.builder().role("user").content(userMessage).build();
+        history.add(ChatRequest.Message.builder().role("user").content(userMessage).build());
 
-        // 2. 加入历史
-        history.add(userMsgObj);
+        int currentCall = 0;
 
         try {
-            // 3. 发送请求
             String aiResponse = sendRequestToLlm();
 
-            // 3. 🕵️‍♂️ 检测 AI 是否想调用工具
-            if (aiResponse.startsWith("[TOOL:") && aiResponse.contains("]")) {
-                log.info("🔍 1. 命中工具调用规则，原始指令: {}", aiResponse);
+            while (currentCall < MAX_TOOL_CALLS) {
+                // 🛑 核心修复：防止 NPE
+                if (aiResponse == null) {
+                    throw new RuntimeException("API 调用返回了空结果 (可能是网络问题或被拦截)");
+                }
 
-                try {
-                    // --- 🛡️ 更稳健的解析逻辑 Start ---
-                    // 找到第一个 ] 的位置，防止后面有空格或换行干扰
-                    int endIndex = aiResponse.indexOf("]");
-                    // 提取中间内容： "read_file pom.xml"
-                    String commandContent = aiResponse.substring(7, endIndex).trim();
+                int toolStartIndex = aiResponse.indexOf("[TOOL:");
+                if (toolStartIndex != -1 && aiResponse.contains("]")) {
+                    currentCall++;
+                    log.info("🔄 Agent Loop: 第 {}/{} 次工具调用...", currentCall, MAX_TOOL_CALLS);
 
-                    String toolName;
-                    String args;
+                    // --- 解析指令 ---
+                    int toolEndIndex = aiResponse.indexOf("]", toolStartIndex);
+                    String commandString = aiResponse.substring(toolStartIndex, toolEndIndex + 1);
+                    String commandContent = commandString.substring(7, commandString.length() - 1).trim();
 
-                    // 拆分工具名和参数
-                    if (commandContent.contains(" ")) {
-                        String[] parts = commandContent.split(" ", 2);
-                        toolName = parts[0];
-                        args = parts[1].trim();
-                    } else {
-                        toolName = commandContent;
-                        args = "";
-                    }
-                    // --- 🛡️ 解析逻辑 End ---
+                    String toolName = commandContent.split(" ", 2)[0];
+                    String args = commandContent.contains(" ") ? commandContent.split(" ", 2)[1].trim() : "";
 
-                    log.info("🛠️ 2. 解析成功 -> 工具名: [{}], 参数: [{}]", toolName, args);
-
-                    // 执行工具
+                    // --- 执行工具 ---
                     String toolResult;
                     if (toolMap.containsKey(toolName)) {
-                        log.info("🚀 3. 正在执行工具...");
+                        log.info("🚀 执行工具: [{}]", toolName);
                         toolResult = toolMap.get(toolName).execute(args);
-                        log.info("✅ 4. 工具执行完成，结果长度: {} 字符", toolResult.length());
+                        log.info("✅ 工具执行完毕");
                     } else {
-                        log.warn("⚠️ 找不到工具: {}", toolName);
                         toolResult = "系统错误：找不到名为 " + toolName + " 的工具";
                     }
 
-                    // 4. 把工具执行结果返回给 AI (这就叫 "Function Calling Loop")
+                    // --- 记录结果 ---
                     history.add(ChatRequest.Message.builder()
                             .role("system")
-                            .content("工具 [" + toolName + "] 执行结果:\n" + toolResult)
+                            .content("工具执行结果:\n" + toolResult)
                             .build());
 
-                    log.info("🔄 5. 正在将工具结果回传给 AI...");
-                    // 5. 再次请求 LLM，让它根据文件内容生成最终回答
-                    return sendRequestToLlm();
+                    // --- 再次请求 AI ---
+                    aiResponse = sendRequestToLlm();
 
-                } catch (Exception e) {
-                    log.error("❌ 工具调用流程发生异常", e);
-                    return "工具调用失败: " + e.getMessage();
+                } else {
+                    return aiResponse;
                 }
             }
 
-            // 如果不是工具调用，直接返回回答
-            return aiResponse;
+            return "❌ 任务执行失败：Agent 陷入了思维死循环。";
 
         } catch (Exception e) {
-            log.error("API 调用异常", e);
-
-            // 🛠️ 修复核心：如果报错了，把刚才加进去的那句话删掉！
-            // 这样下次发请求时，就不会带上这句失败的话了。
-            history.remove(history.size() - 1);
-
-            return "调用失败 (已回滚上下文): " + e.getMessage();
+            log.error("Agent 运行异常", e);
+            if (!history.isEmpty() && "user".equals(history.get(history.size() - 1).getRole())) {
+                history.remove(history.size() - 1);
+            }
+            return "系统异常: " + e.getMessage();
         }
     }
 
-    // 抽取出来的私有方法，避免代码重复
+    // 🛑 核心修复：确保不吞异常，不返回 null
     private String sendRequestToLlm() {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -166,19 +144,20 @@ public class AiService {
                 .build();
 
         try {
-            HttpEntity<ChatRequest> entity = new HttpEntity<>(request, headers);
-            ResponseEntity<ChatResponse> response = restTemplate.postForEntity(apiUrl, entity, ChatResponse.class);
+            ResponseEntity<ChatResponse> response = restTemplate.postForEntity(apiUrl, new HttpEntity<>(request, headers), ChatResponse.class);
 
             if (response.getBody() != null && !response.getBody().getChoices().isEmpty()) {
                 String reply = response.getBody().getChoices().get(0).getMessage().getContent();
-                // 记录 AI 的回复
                 history.add(ChatRequest.Message.builder().role("assistant").content(reply).build());
                 return reply;
             }
-            return "AI 响应为空";
+            // 如果 Body 是 null，抛出异常，不要返回 null！
+            throw new RuntimeException("AI API 返回了 200 OK 但内容为空");
+
         } catch (Exception e) {
-            log.error("API 调用异常", e);
-            return "API Error: " + e.getMessage();
+            // 这里我们抛出运行时异常，让 callAi 的 catch 块去处理
+            // 这样就能在日志里看到具体的错误（比如 400 Bad Request 或 502 Bad Gateway）
+            throw new RuntimeException("请求 LLM 失败: " + e.getMessage(), e);
         }
     }
 

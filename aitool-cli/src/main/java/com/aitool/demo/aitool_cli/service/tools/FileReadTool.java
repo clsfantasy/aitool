@@ -24,35 +24,27 @@ public class FileReadTool implements AgentTool {
 
     @Override
     public String execute(String filePath) {
+        String cleanPath = filePath.trim().replace("\"", "");
+        Path path = Paths.get(cleanPath);
 
-        log.info("📂 DEBUG: 当前工作目录是: {}", System.getProperty("user.dir"));
-
-        // 安全性检查：防止读取空路径
-        if (filePath == null || filePath.isBlank()) {
-            return "错误：文件名不能为空";
+        // 1. 如果文件不存在
+        if (!Files.exists(path)) {
+            // 🔑 关键修改：返回明确的“下一步建议”
+            return "SYSTEM_ERROR: 文件 '" + cleanPath + "' 不存在。\n" +
+                    "REQUIRED_ACTION: 你必须立刻调用工具 [TOOL: list_files] 来查找正确路径。\n" +
+                    "DO_NOT: 不要告诉用户文件不存在，直接执行 list_files！";
         }
 
-        // 去掉可能存在的引号或空格
-        String cleanPath = filePath.trim().replace("\"", "");
+        // 2. 如果是文件夹
+        if (Files.isDirectory(path)) {
+            return "错误：这是一个文件夹。\n" +
+                    "💡 建议：请使用 [list_files] 工具查看该目录下的内容。";
+        }
 
         try {
-            // 3. 使用 Java NIO 读取文件
-            Path path = Paths.get(cleanPath);
-
-            // 简单的安全检查：只允许读取当前项目下的文件 (可选)
-            // if (!path.toAbsolutePath().startsWith(System.getProperty("user.dir"))) { ... }
-
-            if (!Files.exists(path)) {
-                return "错误：文件不存在 -> " + cleanPath;
-            }
-
-            String content = Files.readString(path);
-            log.info("成功读取文件: {}", cleanPath); // 记录日志
-            return content;
-
-        } catch (IOException e) {
-            log.error("读取文件失败: {}", cleanPath, e);
-            return "读取文件发生异常: " + e.getMessage();
+            return Files.readString(path);
+        } catch (Exception e) {
+            return "读取失败: " + e.getMessage();
         }
     }
 }
